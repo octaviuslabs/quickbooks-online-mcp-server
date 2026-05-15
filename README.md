@@ -391,7 +391,7 @@ QUICKBOOKS_ENVIRONMENT=sandbox  # or 'production'
 ### Common pitfalls
 
 - **`.env` loaded from the wrong directory.** The server resolves `.env` relative to the compiled module, not your shell's CWD. If you launch via Claude Desktop, this matters — make sure you're on current `main`.
-- **Redirect URI mismatch.** The URI you register in the Intuit portal must match **exactly** — protocol, host, port, path. `http://localhost:8000/callback` ≠ `http://127.0.0.1:8000/callback`.
+- **Redirect URI mismatch.** The URI you register in the Intuit portal must match **exactly** — protocol, host, port, path. `http://localhost:8000/callback` .
 
 ---
 
