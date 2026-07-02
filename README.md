@@ -102,6 +102,56 @@ Add to your Claude Code MCP configuration:
 
 Set any of the `DISABLE_*` flags to `"true"` to prevent that category of tools from being registered. Read tools (`get_*`, `search_*`) are always available.
 
+### Remote HTTP Server (Streamable HTTP + OAuth)
+
+Besides the stdio entry point above, the server can run as a **stateless
+Streamable HTTP** service that any MCP client can connect to with just a URL —
+no pre-generated refresh token, no `.env` tokens. Users are sent through
+QuickBooks' own consent screen the first time they connect.
+
+```bash
+npm run start:http
+```
+
+Environment:
+
+```env
+QUICKBOOKS_CLIENT_ID=your_client_id
+QUICKBOOKS_CLIENT_SECRET=your_client_secret
+QUICKBOOKS_ENVIRONMENT=sandbox            # or production
+MCP_BASE_URL=https://qbo-mcp.example.com  # public URL of this server
+# PORT=3000
+# MCP_TOKEN_ENCRYPTION_KEY=<32-byte hex or base64>  # optional; derived from the client secret if unset
+```
+
+Setup:
+
+1. Deploy the server behind HTTPS at `MCP_BASE_URL`.
+2. In your [Intuit app](https://developer.intuit.com), register
+   `{MCP_BASE_URL}/callback` as a redirect URI.
+3. Point an MCP client (Claude, etc.) at `{MCP_BASE_URL}/mcp`. The client
+   discovers the OAuth endpoints via `/.well-known/oauth-protected-resource/mcp`,
+   registers itself dynamically, and walks the user through the QuickBooks
+   consent flow.
+
+How it works: Intuit's OAuth service supports neither Dynamic Client
+Registration nor arbitrary redirect URIs, so the server doubles as an OAuth
+2.1 authorization server that **proxies DCR and the authorization-code flow
+onto Intuit**. `/register`, `/authorize`, `/token`, and `/revoke` are served
+locally; user consent happens on Intuit; the Intuit access/refresh tokens and
+realm ID are sealed (AES-256-GCM) inside the tokens issued to the MCP client.
+Nothing is stored server-side — registrations, authorization codes, and tokens
+are all self-contained encrypted blobs — so the endpoint is fully stateless
+and horizontally scalable, and each request is executed against the QuickBooks
+company of whoever presents the bearer token. Tool responses stream back over
+SSE within each POST.
+
+If you run more than one replica, set `MCP_TOKEN_ENCRYPTION_KEY` explicitly
+(any 32-byte hex/base64 value) or make sure all replicas share the same
+`QUICKBOOKS_CLIENT_SECRET`, since the sealing key is derived from it by
+default. Rotating the key or secret invalidates all outstanding tokens, which
+simply forces clients to re-authorize.
+
 ---
 
 ## Available Tools
@@ -427,12 +477,15 @@ The test suite includes **396 tests** with **100% code coverage** across all met
 
 ```
 src/
-├── clients/          # QuickBooks API client
-├── handlers/         # Business logic handlers (87 files)
+├── auth/            # OAuth DCR proxy + sealed-token crypto (HTTP mode)
+├── clients/         # QuickBooks API client + per-request context
+├── handlers/        # Business logic handlers (87 files)
+├── server/          # MCP server factory (registers all tools)
 ├── tools/           # MCP tool definitions
 ├── helpers/         # Utility functions
 ├── types/           # TypeScript types
-└── index.ts         # Server entry point
+├── index.ts         # stdio entry point
+└── http-server.ts   # Stateless Streamable HTTP entry point
 
 tests/
 ├── unit/            # Unit tests (396 tests)

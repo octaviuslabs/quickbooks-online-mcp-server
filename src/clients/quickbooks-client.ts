@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import open from 'open';
+import { quickbooksRequestContext } from './request-context.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -389,10 +390,34 @@ export class QuickbooksClient {
     return this.authInFlight;
   }
 
+  // Builds a QuickBooks instance from externally supplied credentials (the
+  // stateless HTTP transport, where each request carries its own Intuit
+  // access token) instead of the singleton's env-based token lifecycle.
+  private createForRequestContext(ctx: { accessToken: string; realmId: string }): QuickBooks {
+    return new QuickBooks(
+      this.clientId,
+      this.clientSecret,
+      ctx.accessToken,
+      false, // no token secret for OAuth 2.0
+      ctx.realmId,
+      this.environment === 'sandbox',
+      false, // debug?
+      null,  // minor version
+      '2.0', // oauth version
+      undefined // no refresh token — the MCP client refreshes via OAuth
+    );
+  }
+
   // ── Called by every handler on every request ─────────────────────────────
   // Checks token freshness on each invocation so handlers stay functional
   // across 60-minute token boundaries without server restarts.
   static async getInstance(): Promise<QuickBooks> {
+    // HTTP mode: per-request credentials from the sealed bearer token win
+    // over the process-wide singleton, so one server can serve many users.
+    const ctx = quickbooksRequestContext.getStore();
+    if (ctx) {
+      return quickbooksClient.createForRequestContext(ctx);
+    }
     if (quickbooksClient.isTokenExpiredOrExpiringSoon()) {
       await quickbooksClient.authenticate();
     }
@@ -407,6 +432,14 @@ export class QuickbooksClient {
   // (e.g. POST /upload for binary attachments). Ensures token freshness on
   // every invocation, same as getInstance().
   static async getAuthCredentials(): Promise<{ accessToken: string; realmId: string; isSandbox: boolean }> {
+    const ctx = quickbooksRequestContext.getStore();
+    if (ctx) {
+      return {
+        accessToken: ctx.accessToken,
+        realmId: ctx.realmId,
+        isSandbox: quickbooksClient.environment === 'sandbox',
+      };
+    }
     if (quickbooksClient.isTokenExpiredOrExpiringSoon() || !quickbooksClient.accessToken) {
       await quickbooksClient.authenticate();
     }
