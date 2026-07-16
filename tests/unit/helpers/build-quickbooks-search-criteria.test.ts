@@ -1,5 +1,8 @@
 import { describe, it, expect } from '@jest/globals';
-import { buildQuickbooksSearchCriteria } from '../../../src/helpers/build-quickbooks-search-criteria';
+import {
+  buildQuickbooksSearchCriteria,
+  defaultQuickbooksSearchCriteria,
+} from '../../../src/helpers/build-quickbooks-search-criteria';
 
 describe('buildQuickbooksSearchCriteria – Fixes #13', () => {
   it('should pass through a simple criteria object', () => {
@@ -73,5 +76,16 @@ describe('buildQuickbooksSearchCriteria – Fixes #13', () => {
     // Not advanced, so returned as-is per the pass-through logic
     expect(buildQuickbooksSearchCriteria(null as any)).toBeNull();
     expect(buildQuickbooksSearchCriteria(undefined as any)).toBeUndefined();
+  });
+});
+
+describe('defaultQuickbooksSearchCriteria', () => {
+  it('defaults omitted criteria to an empty object', () => {
+    expect(defaultQuickbooksSearchCriteria(undefined)).toEqual({});
+  });
+
+  it('preserves supplied criteria', () => {
+    const criteria = [{ field: 'Name', value: 'Foo' }];
+    expect(defaultQuickbooksSearchCriteria(criteria)).toBe(criteria);
   });
 });

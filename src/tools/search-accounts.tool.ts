@@ -1,4 +1,5 @@
 import { searchQuickbooksAccounts } from "../handlers/search-quickbooks-accounts.handler.js";
+import { defaultQuickbooksSearchCriteria } from "../helpers/build-quickbooks-search-criteria.js";
 import { ToolDefinition } from "../types/tool-definition.js";
 import { z } from "zod";
 
@@ -166,11 +167,11 @@ function normalizeAccountCriteria(criteria: any): any {
 // Schema exposed to function definition – use broad schema to sidestep $ref errors
 const criteriaSchema = z.any();
 
-const toolSchema = z.object({ criteria: criteriaSchema });
+const toolSchema = z.object({ criteria: criteriaSchema.optional() });
 
 // Tool handler with runtime validation & coercion
 const toolHandler = async ({ params }: any) => {
-  const { criteria } = params;
+  const criteria = defaultQuickbooksSearchCriteria(params.criteria);
   const parsed = RUNTIME_CRITERIA_SCHEMA.safeParse(criteria);
   if (!parsed.success) {
     return { content: [{ type: "text" as const, text: `Invalid criteria: ${parsed.error.message}` }] };
@@ -195,4 +196,4 @@ export const SearchAccountsTool: ToolDefinition<typeof toolSchema> = {
   description: toolDescription,
   schema: toolSchema,
   handler: toolHandler,
-}; 
+};

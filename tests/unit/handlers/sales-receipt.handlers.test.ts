@@ -244,6 +244,12 @@ describe('SalesReceipt Handlers', () => {
       });
 
       expect(result.isError).toBe(false);
+      expect((mockQuickBooksInstance.findSalesReceipts.mock.calls[0] as any)[0]).toEqual([
+        { field: 'CustomerRef', value: 'cust-1', operator: undefined },
+        { field: 'TxnDate', value: '2024-01-01', operator: '>=' },
+        { field: 'TxnDate', value: '2024-12-31', operator: '<=' },
+        { field: 'limit', value: 50 },
+      ]);
     });
 
     it('should handle empty QueryResponse', async () => {
@@ -258,5 +264,3 @@ describe('SalesReceipt Handlers', () => {
     });
   });
 });
-
-

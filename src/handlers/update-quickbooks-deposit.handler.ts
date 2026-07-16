@@ -11,17 +11,35 @@ export interface UpdateDepositInput {
 export async function updateQuickbooksDeposit(data: UpdateDepositInput): Promise<ToolResponse<any>> {
   try {
     const quickbooks = await QuickbooksClient.getInstance();
-    const payload: any = { Id: data.id, SyncToken: data.sync_token, sparse: true };
-    if (data.private_note) payload.PrivateNote = data.private_note;
-
-    return new Promise((resolve) => {
-      (quickbooks as any).updateDeposit(payload, (err: any, updated: any) => {
-        if (err) resolve({ result: null, isError: true, error: formatError(err) });
-        else resolve({ result: updated, isError: false, error: null });
+    const existing = await new Promise<any>((resolve, reject) => {
+      (quickbooks as any).getDeposit(data.id, (err: any, deposit: any) => {
+        if (err) reject(err);
+        else resolve(deposit);
       });
     });
+
+    const payload: any = {
+      ...existing,
+      Id: data.id,
+      SyncToken: data.sync_token,
+      sparse: false,
+    };
+    delete payload.domain;
+    delete payload.MetaData;
+
+    if (data.private_note !== undefined) {
+      payload.PrivateNote = data.private_note;
+    }
+
+    const updated = await new Promise<any>((resolve, reject) => {
+      (quickbooks as any).updateDeposit(payload, (err: any, result: any) => {
+        if (err) reject(err);
+        else resolve(result);
+      });
+    });
+
+    return { result: updated, isError: false, error: null };
   } catch (error) {
     return { result: null, isError: true, error: formatError(error) };
   }
 }
-

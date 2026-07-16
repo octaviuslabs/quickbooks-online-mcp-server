@@ -1,4 +1,5 @@
 import { searchQuickbooksItems } from "../handlers/search-quickbooks-items.handler.js";
+import { defaultQuickbooksSearchCriteria } from "../helpers/build-quickbooks-search-criteria.js";
 import { ToolDefinition } from "../types/tool-definition.js";
 import { z } from "zod";
 
@@ -87,10 +88,10 @@ const RUNTIME_CRITERIA_SCHEMA = z.union([
 ]);
 
 // Exposed schema for OpenAI/JSON – use broad schema to avoid deep $ref issues
-const toolSchema = z.object({ criteria: z.any() });
+const toolSchema = z.object({ criteria: z.any().optional() });
 
 const toolHandler = async ({ params }: any) => {
-  const { criteria } = params;
+  const criteria = defaultQuickbooksSearchCriteria(params.criteria);
 
   // Validate against runtime schema
   const parsed = RUNTIME_CRITERIA_SCHEMA.safeParse(criteria);
@@ -141,4 +142,4 @@ export const SearchItemsTool: ToolDefinition<typeof toolSchema> = {
   description: toolDescription,
   schema: toolSchema,
   handler: toolHandler,
-}; 
+};

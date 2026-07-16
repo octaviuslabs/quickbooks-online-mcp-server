@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { pathToFileURL } from "url";
 import { QuickbooksMCPServer } from "./server/qbo-mcp-server.js";
 // import { ListInvoicesTool } from "./tools/list-invoices.tool.js";
 // import { CreateCustomerTool } from "./tools/create-customer.tool.js";
@@ -200,9 +201,9 @@ import { GetAgedPayablesTool } from "./tools/get-aged-payables.tool.js";
 import { GetVendorExpensesTool } from "./tools/get-vendor-expenses.tool.js";
 import { GetVendorBalanceTool } from "./tools/get-vendor-balance.tool.js";
 
-const main = async () => {
+export const createQuickbooksMCPServer = () => {
   // Create an MCP server
-  const server = QuickbooksMCPServer.GetServer();
+  const server = QuickbooksMCPServer.CreateServer();
   // Add tools for customers
   RegisterTool(server, CreateCustomerTool);
   RegisterTool(server, GetCustomerTool);
@@ -424,12 +425,20 @@ const main = async () => {
   RegisterTool(server, GetVendorExpensesTool);
   RegisterTool(server, GetVendorBalanceTool);
 
+  return server;
+};
+
+const main = async () => {
+  const server = createQuickbooksMCPServer();
+
   // Start receiving messages on stdin and sending messages on stdout
   const transport = new StdioServerTransport();
   await server.connect(transport);
 };
 
-main().catch((error) => {
-  console.error("Error:", error);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    console.error("Error:", error);
+    process.exit(1);
+  });
+}

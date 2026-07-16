@@ -1,0 +1,15 @@
+node_modules
+dist
+coverage
+
+.git
+.qodo
+.DS_Store
+
+.env
+.env.*
+!.env.example
+tokens.json
+capture-*.txt
+
+npm-debug.log*

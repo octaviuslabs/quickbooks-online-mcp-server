@@ -117,14 +117,37 @@ describe('Deposit and Transfer Handlers', () => {
     });
 
     it('should update a deposit', async () => {
+      mockQuickBooksInstance.getDeposit.mockImplementation((_id: any, cb: any) => cb(null, {
+        Id: '1',
+        SyncToken: '0',
+        DepositToAccountRef: { value: 'account-1' },
+        Line: [{ Amount: 1000 }],
+        domain: 'QBO',
+        MetaData: { CreateTime: '2024-01-01' },
+      }));
       mockQuickBooksInstance.updateDeposit.mockImplementation((payload: any, cb: any) => cb(null, {}));
 
       const result = await updateQuickbooksDeposit({ id: '1', sync_token: '0' });
 
       expect(result.isError).toBe(false);
+      const payload = (mockQuickBooksInstance.updateDeposit.mock.calls[0] as any)[0];
+      expect(payload).toEqual({
+        Id: '1',
+        SyncToken: '0',
+        DepositToAccountRef: { value: 'account-1' },
+        Line: [{ Amount: 1000 }],
+        sparse: false,
+      });
     });
 
     it('should update a deposit with all optional fields', async () => {
+      mockQuickBooksInstance.getDeposit.mockImplementation((_id: any, cb: any) => cb(null, {
+        Id: '1',
+        SyncToken: '0',
+        DepositToAccountRef: { value: 'account-1' },
+        Line: [{ Amount: 1000 }],
+        PrivateNote: 'Original note',
+      }));
       mockQuickBooksInstance.updateDeposit.mockImplementation((payload: any, cb: any) => cb(null, {}));
 
       const result = await updateQuickbooksDeposit({
@@ -134,6 +157,10 @@ describe('Deposit and Transfer Handlers', () => {
       });
 
       expect(result.isError).toBe(false);
+      expect((mockQuickBooksInstance.updateDeposit.mock.calls[0] as any)[0]).toMatchObject({
+        PrivateNote: 'Updated deposit note',
+        sparse: false,
+      });
     });
 
     it('should update a deposit - authentication error', async () => {
@@ -146,6 +173,12 @@ describe('Deposit and Transfer Handlers', () => {
     });
 
     it('should update a deposit - API error', async () => {
+      mockQuickBooksInstance.getDeposit.mockImplementation((_id: any, cb: any) => cb(null, {
+        Id: '1',
+        SyncToken: '0',
+        DepositToAccountRef: { value: 'account-1' },
+        Line: [{ Amount: 1000 }],
+      }));
       mockQuickBooksInstance.updateDeposit.mockImplementation((payload: any, cb: any) =>
         cb(new Error('Update failed'), null)
       );
@@ -153,6 +186,18 @@ describe('Deposit and Transfer Handlers', () => {
       const result = await updateQuickbooksDeposit({ id: '1', sync_token: '0' });
 
       expect(result.isError).toBe(true);
+    });
+
+    it('should return an error when the existing deposit cannot be read', async () => {
+      mockQuickBooksInstance.getDeposit.mockImplementation((_id: any, cb: any) =>
+        cb(new Error('Read failed'), null)
+      );
+
+      const result = await updateQuickbooksDeposit({ id: '1', sync_token: '0' });
+
+      expect(result.isError).toBe(true);
+      expect(result.error).toContain('Read failed');
+      expect(mockQuickBooksInstance.updateDeposit).not.toHaveBeenCalled();
     });
 
     it('should delete a deposit', async () => {
@@ -447,5 +492,4 @@ describe('Deposit and Transfer Handlers', () => {
     });
   });
 });
-
 

@@ -37,6 +37,12 @@ export type QuickbooksSearchCriteriaInput =
   | Array<Record<string, any>>
   | AdvancedQuickbooksSearchOptions;
 
+export function defaultQuickbooksSearchCriteria(
+  input: QuickbooksSearchCriteriaInput | undefined
+): QuickbooksSearchCriteriaInput {
+  return input === undefined ? {} : input;
+}
+
 /**
  * Convert various input shapes into the criteria shape that `node-quickbooks` expects.
  *
@@ -108,4 +114,4 @@ export function buildQuickbooksSearchCriteria(
 
   // If nothing ended up in the array, return empty object so Quickbooks returns all items.
   return criteriaArr.length > 0 ? criteriaArr : {};
-} 
+}

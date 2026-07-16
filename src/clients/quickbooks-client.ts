@@ -1,13 +1,17 @@
 import dotenv from "dotenv";
+import crypto from "node:crypto";
 import QuickBooks from "node-quickbooks";
 import OAuthClient from "intuit-oauth";
-import http from 'http';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import open from 'open';
+import http from "http";
+import fs from "fs";
+import path from "path";
+import { AsyncLocalStorage } from "async_hooks";
+import { fileURLToPath } from "url";
+import open from "open";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const entrypoint = process.argv[1] ? path.basename(process.argv[1]) : "";
+const isHttpEntrypoint = entrypoint.startsWith("http-server.");
 
 // Resolve .env relative to the installed module (../../.env from dist/clients/).
 // This matters when the MCP server is spawned by a host (e.g. Claude Desktop,
@@ -18,28 +22,70 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // placeholders a host app (e.g. Claude Desktop) may inject via its env config.
 // This prevents the server from starting with blank REFRESH_TOKEN / REALM_ID
 // even when the host config has those keys set to "".
-dotenv.config({ path: path.join(__dirname, '..', '..', '.env'), override: true });
+if (!isHttpEntrypoint) {
+  dotenv.config({
+    path: path.join(__dirname, "..", "..", ".env"),
+    override: true,
+  });
+}
 
 // Register once at module level — registering inside startOAuthFlow() would
 // accumulate duplicate handlers on every OAuth call.
-process.on('uncaughtException', (err) => {
-  console.error('[auth-server] uncaughtException:', err);
+process.on("uncaughtException", (err) => {
+  console.error("[qbo-client] uncaughtException:", err);
 });
-process.on('unhandledRejection', (reason) => {
-  console.error('[auth-server] unhandledRejection:', reason);
+process.on("unhandledRejection", (reason) => {
+  console.error("[qbo-client] unhandledRejection:", reason);
 });
 
-const client_id = process.env.QUICKBOOKS_CLIENT_ID;
-const client_secret = process.env.QUICKBOOKS_CLIENT_SECRET;
-const refresh_token = process.env.QUICKBOOKS_REFRESH_TOKEN;
-const realm_id = process.env.QUICKBOOKS_REALM_ID;
-const environment = process.env.QUICKBOOKS_ENVIRONMENT || 'sandbox';
+const client_id = isHttpEntrypoint
+  ? undefined
+  : process.env.QUICKBOOKS_CLIENT_ID;
+const client_secret = isHttpEntrypoint
+  ? undefined
+  : process.env.QUICKBOOKS_CLIENT_SECRET;
+const refresh_token = isHttpEntrypoint
+  ? undefined
+  : process.env.QUICKBOOKS_REFRESH_TOKEN;
+const realm_id = isHttpEntrypoint ? undefined : process.env.QUICKBOOKS_REALM_ID;
+const environment = isHttpEntrypoint
+  ? "sandbox"
+  : process.env.QUICKBOOKS_ENVIRONMENT || "sandbox";
 // Fix for Issue #5: Use env var with underscore (QUICKBOOKS_REDIRECT_URI)
-const redirect_uri = process.env.QUICKBOOKS_REDIRECT_URI || 'http://localhost:8000/callback';
+const redirect_uri = isHttpEntrypoint
+  ? "http://localhost:8000/callback"
+  : process.env.QUICKBOOKS_REDIRECT_URI || "http://localhost:8000/callback";
 
-// Only throw error if client_id or client_secret is missing
-if (!client_id || !client_secret || !redirect_uri) {
-  throw Error("Client ID, Client Secret and Redirect URI must be set in environment variables");
+export interface QuickbooksClientConfig {
+  clientId?: string;
+  clientSecret?: string;
+  // When set, the client runs in static-token mode: it uses this access token
+  // as-is and never performs OAuth (no interactive flow, no refresh). The
+  // token owner is responsible for refreshing and retrying on auth failures.
+  accessToken?: string;
+  refreshToken?: string;
+  realmId?: string;
+  environment: string;
+  redirectUri?: string;
+  allowInteractiveAuth?: boolean;
+  persistTokensToEnv?: boolean;
+  onTokensUpdated?: (tokens: QuickbooksTokenUpdate) => void;
+}
+
+export interface QuickbooksTokenUpdate {
+  accessToken?: string;
+  refreshToken?: string;
+  realmId?: string;
+  expiresIn?: number;
+}
+
+const quickbooksClientStorage = new AsyncLocalStorage<QuickbooksClient>();
+
+export function runWithQuickbooksClient<T>(
+  client: QuickbooksClient,
+  callback: () => T,
+): T {
+  return quickbooksClientStorage.run(client, callback);
 }
 
 // ── QuickbooksClient ─────────────────────────────────────────────────────────
@@ -55,9 +101,13 @@ export class QuickbooksClient {
   private accessToken?: string;
   private accessTokenExpiry?: Date;
   private quickbooksInstance?: QuickBooks;
-  private oauthClient: OAuthClient;
+  private oauthClient?: OAuthClient;
   private isAuthenticating: boolean = false;
   private redirectUri: string;
+  private readonly staticAccessToken: boolean;
+  private readonly allowInteractiveAuth: boolean;
+  private readonly persistTokensToEnv: boolean;
+  private readonly onTokensUpdated?: (tokens: QuickbooksTokenUpdate) => void;
 
   // Refresh 5 minutes before actual expiry to avoid edge cases
   private static readonly TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
@@ -65,58 +115,82 @@ export class QuickbooksClient {
   // Shared in-flight refresh promise so that concurrent callers all await the
   // same network request rather than racing to use (and rotate) the refresh
   // token simultaneously.
-  private refreshInFlight?: Promise<{ access_token: string; expires_in: number }>;
+  private refreshInFlight?: Promise<{
+    access_token: string;
+    expires_in: number;
+  }>;
 
   // Shared in-flight authenticate promise. Guards the cold-start path so two
   // concurrent first callers cannot both pass the freshness check and both
   // invoke startOAuthFlow() / rebuild the QuickBooks instance.
   private authInFlight?: Promise<QuickBooks>;
 
-  constructor(config: {
-    clientId: string;
-    clientSecret: string;
-    refreshToken?: string;
-    realmId?: string;
-    environment: string;
-    redirectUri: string;
-  }) {
-    this.clientId = config.clientId;
-    this.clientSecret = config.clientSecret;
+  constructor(config: QuickbooksClientConfig) {
+    this.clientId = config.clientId ?? "";
+    this.clientSecret = config.clientSecret ?? "";
+    this.staticAccessToken = Boolean(config.accessToken);
+    this.accessToken = config.accessToken;
     this.refreshToken = config.refreshToken;
     this.realmId = config.realmId;
     this.environment = config.environment;
-    this.redirectUri = config.redirectUri;
-    this.oauthClient = new OAuthClient({
-      clientId: this.clientId,
-      clientSecret: this.clientSecret,
-      environment: this.environment,
-      redirectUri: this.redirectUri,
-    });
+    this.redirectUri = config.redirectUri ?? "";
+    this.allowInteractiveAuth = config.allowInteractiveAuth ?? true;
+    this.persistTokensToEnv = config.persistTokensToEnv ?? true;
+    this.onTokensUpdated = config.onTokensUpdated;
   }
 
   private isTokenExpiredOrExpiringSoon(): boolean {
+    // Static-token mode has no expiry knowledge: the token is used as-is and
+    // QuickBooks rejects it when expired — refreshing is the caller's job.
+    if (this.staticAccessToken) return false;
     if (!this.accessToken || !this.accessTokenExpiry) return true;
-    return this.accessTokenExpiry <= new Date(Date.now() + QuickbooksClient.TOKEN_REFRESH_BUFFER_MS);
+    return (
+      this.accessTokenExpiry <=
+      new Date(Date.now() + QuickbooksClient.TOKEN_REFRESH_BUFFER_MS)
+    );
+  }
+
+  private validateClientCredentials(): void {
+    if (!this.clientId || !this.clientSecret) {
+      throw new Error("Client ID and Client Secret must be set");
+    }
+  }
+
+  private getOAuthClient(): OAuthClient {
+    this.validateClientCredentials();
+
+    if (!this.oauthClient) {
+      this.oauthClient = new OAuthClient({
+        clientId: this.clientId,
+        clientSecret: this.clientSecret,
+        environment: this.environment,
+        redirectUri: this.redirectUri || "http://localhost:8000/callback",
+      });
+    }
+
+    return this.oauthClient;
   }
 
   private async startOAuthFlow(): Promise<void> {
+    this.validateClientCredentials();
+
     if (this.isAuthenticating) {
       return;
     }
 
     this.isAuthenticating = true;
     const port = 8000;
+    const expectedState = crypto.randomBytes(32).toString("base64url");
+    const flowRedirectUri =
+      this.redirectUri || `http://localhost:${port}/callback`;
 
-    // The local server below receives the callback, so the authorize/exchange
-    // pair must use the localhost redirect even when QUICKBOOKS_REDIRECT_URI
-    // points elsewhere (e.g. the OAuth playground used for manual token
-    // generation). Intuit rejects the exchange if the redirect_uri does not
-    // match the one used in the authorize request.
+    // The same redirect URI must be used for authorization and code exchange.
+    // A public HTTPS URI can point at this listener through a local tunnel.
     const flowClient = new OAuthClient({
       clientId: this.clientId,
       clientSecret: this.clientSecret,
       environment: this.environment,
-      redirectUri: `http://localhost:${port}/callback`,
+      redirectUri: flowRedirectUri,
     });
 
     return new Promise((resolve, reject) => {
@@ -126,24 +200,43 @@ export class QuickbooksClient {
 
         // Respond to anything that isn't /callback so diagnostic probes (curl,
         // ngrok health checks, favicon requests, etc.) don't hang the server.
-        if (!req.url?.startsWith('/callback')) {
-          res.writeHead(404, { 'Content-Type': 'text/plain' });
-          res.end('Not Found. Waiting for QuickBooks OAuth callback at /callback');
+        if (!req.url?.startsWith("/callback")) {
+          res.writeHead(404, { "Content-Type": "text/plain" });
+          res.end(
+            "Not Found. Waiting for QuickBooks OAuth callback at /callback",
+          );
           return;
         }
 
         {
           try {
+            const callbackUrl = new URL(req.url, `http://localhost:${port}`);
+            const returnedState = callbackUrl.searchParams.get("state");
+            if (returnedState !== expectedState) {
+              res.writeHead(400, { "Content-Type": "text/plain" });
+              res.end("Invalid OAuth state");
+              return;
+            }
+
             const response = await flowClient.createToken(req.url);
-            const tokens = response.token;
+            const tokens = response.token as unknown as {
+              access_token: string;
+              refresh_token: string;
+              expires_in?: number;
+              realmId: string;
+            };
 
             // Save tokens
+            this.accessToken = tokens.access_token;
+            this.accessTokenExpiry = new Date(
+              Date.now() + (tokens.expires_in || 3600) * 1000,
+            );
             this.refreshToken = tokens.refresh_token;
             this.realmId = tokens.realmId;
             this.saveTokensToEnv();
 
             // Send success response
-            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.writeHead(200, { "Content-Type": "text/html" });
             res.end(`
               <html>
                 <body style="
@@ -169,8 +262,8 @@ export class QuickbooksClient {
               resolve();
             }, 1000);
           } catch (error) {
-            console.error('Error during token creation:', error);
-            res.writeHead(500, { 'Content-Type': 'text/html' });
+            console.error("Error during token creation:", error);
+            res.writeHead(500, { "Content-Type": "text/html" });
             res.end(`
               <html>
                 <body style="
@@ -194,22 +287,26 @@ export class QuickbooksClient {
         }
       });
 
-      // Start server — bind to all interfaces (IPv4 + IPv6) so ngrok can reach it
-      // regardless of whether it resolves `localhost` to 127.0.0.1 or ::1
-      server.listen(port, '::', async () => {
+      // The authorization helper is local-only; never expose its callback
+      // listener on LAN interfaces.
+      server.listen(port, "127.0.0.1", async () => {
         const addr = server.address();
-        console.log(`[auth-server] Listening on ${typeof addr === 'string' ? addr : `${addr?.address}:${addr?.port}`} (family: ${typeof addr === 'object' ? addr?.family : 'n/a'})`);
+        console.log(
+          `[auth-server] Listening on ${typeof addr === "string" ? addr : `${addr?.address}:${addr?.port}`} (family: ${typeof addr === "object" ? addr?.family : "n/a"})`,
+        );
 
         // Generate authorization URL with proper type assertion
-        const authUri = flowClient.authorizeUri({
-          scope: [OAuthClient.scopes.Accounting as string],
-          state: 'testState'
-        }).toString();
+        const authUri = flowClient
+          .authorizeUri({
+            scope: [OAuthClient.scopes.Accounting as string],
+            state: expectedState,
+          })
+          .toString();
 
-        console.log('\n=== QuickBooks Authorization ===');
-        console.log('Open this URL in a browser to authorize:\n');
+        console.log("\n=== QuickBooks Authorization ===");
+        console.log("Open this URL in a browser to authorize:\n");
         console.log(authUri);
-        console.log('\nWaiting for callback...\n');
+        console.log("\nWaiting for callback...\n");
 
         // Attempt to open the browser automatically; ignore failures on headless systems
         try {
@@ -220,8 +317,8 @@ export class QuickbooksClient {
       });
 
       // Handle server errors
-      server.on('error', (error) => {
-        console.error('Server error:', error);
+      server.on("error", (error) => {
+        console.error("Server error:", error);
         this.isAuthenticating = false;
         reject(error);
       });
@@ -229,12 +326,14 @@ export class QuickbooksClient {
   }
 
   private saveTokensToEnv(): void {
-    const tokenPath = path.join(__dirname, '..', '..', '.env');
-    const envContent = fs.existsSync(tokenPath) ? fs.readFileSync(tokenPath, 'utf-8') : '';
-    const envLines = envContent.split('\n');
+    const tokenPath = path.join(__dirname, "..", "..", ".env");
+    const envContent = fs.existsSync(tokenPath)
+      ? fs.readFileSync(tokenPath, "utf-8")
+      : "";
+    const envLines = envContent.split("\n");
 
     const updateEnvVar = (name: string, value: string) => {
-      const index = envLines.findIndex(line => line.startsWith(`${name}=`));
+      const index = envLines.findIndex((line) => line.startsWith(`${name}=`));
       if (index !== -1) {
         envLines[index] = `${name}=${value}`;
       } else {
@@ -242,29 +341,46 @@ export class QuickbooksClient {
       }
     };
 
-    if (this.refreshToken) updateEnvVar('QUICKBOOKS_REFRESH_TOKEN', this.refreshToken);
-    if (this.realmId) updateEnvVar('QUICKBOOKS_REALM_ID', this.realmId);
+    if (this.refreshToken)
+      updateEnvVar("QUICKBOOKS_REFRESH_TOKEN", this.refreshToken);
+    if (this.realmId) updateEnvVar("QUICKBOOKS_REALM_ID", this.realmId);
 
     // Atomic write: write to a sibling temp file, then rename. On POSIX rename
     // is atomic within the same filesystem, so a crash mid-write cannot leave
     // .env half-written or empty.
     const tmpPath = `${tokenPath}.tmp.${process.pid}`;
     try {
-      fs.writeFileSync(tmpPath, envLines.join('\n'), { mode: 0o600 });
+      fs.writeFileSync(tmpPath, envLines.join("\n"), { mode: 0o600 });
       fs.renameSync(tmpPath, tokenPath);
     } catch (err) {
-      try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        /* best effort */
+      }
       throw err;
     }
   }
 
   async refreshAccessToken() {
+    if (this.staticAccessToken) {
+      throw new Error(
+        "This QuickBooks client uses a caller-supplied access token and does not refresh tokens",
+      );
+    }
+
+    this.validateClientCredentials();
+
     if (!this.refreshToken) {
+      if (!this.allowInteractiveAuth) {
+        throw new Error("QuickBooks refresh token is required");
+      }
+
       await this.startOAuthFlow();
 
       // Verify we have a refresh token after OAuth flow
       if (!this.refreshToken) {
-        throw new Error('Failed to obtain refresh token from OAuth flow');
+        throw new Error("Failed to obtain refresh token from OAuth flow");
       }
     }
 
@@ -275,7 +391,9 @@ export class QuickbooksClient {
     this.refreshInFlight = (async () => {
       try {
         // At this point we know refreshToken is not undefined
-        const authResponse = await this.oauthClient.refreshUsingToken(this.refreshToken!);
+        const authResponse = await this.getOAuthClient().refreshUsingToken(
+          this.refreshToken!,
+        );
 
         // The intuit-oauth type declarations are incomplete — the runtime
         // token object also contains refresh_token, x_refresh_token_expires_in,
@@ -293,27 +411,46 @@ export class QuickbooksClient {
         this.accessTokenExpiry = new Date(Date.now() + expiresIn * 1000);
 
         // Intuit rotates the refresh token (typically every ~24h). When a new
-        // one is issued we MUST persist it — the old value in .env becomes
-        // stale and will eventually stop working, silently breaking refresh.
+        // one is issued we MUST surface it to the token owner; the old value
+        // eventually stops working and silently breaks refresh.
         const newRefreshToken = token.refresh_token;
         if (newRefreshToken && newRefreshToken !== this.refreshToken) {
           this.refreshToken = newRefreshToken;
-          try {
-            this.saveTokensToEnv();
-            console.error('[qbo-client] Refresh token rotated and persisted to .env');
-          } catch (persistErr) {
-            // Don't fail the whole refresh just because we couldn't write to
-            // disk; the in-memory token is still valid for this process.
-            console.error('[qbo-client] Failed to persist rotated refresh token:', persistErr);
+          this.onTokensUpdated?.({
+            accessToken: this.accessToken,
+            refreshToken: newRefreshToken,
+            realmId: this.realmId,
+            expiresIn,
+          });
+
+          if (this.persistTokensToEnv) {
+            try {
+              this.saveTokensToEnv();
+              console.error(
+                "[qbo-client] Refresh token rotated and persisted to .env",
+              );
+            } catch (persistErr) {
+              // Don't fail the whole refresh just because we couldn't write to
+              // disk; the in-memory token is still valid for this process.
+              console.error(
+                "[qbo-client] Failed to persist rotated refresh token:",
+                persistErr,
+              );
+            }
           }
         }
 
         // Surface the refresh token's own remaining lifetime for observability.
         // Intuit's refresh tokens last 100 days; warn when under 14 days.
         const refreshExpiresIn = token.x_refresh_token_expires_in;
-        if (typeof refreshExpiresIn === 'number' && refreshExpiresIn < 14 * 24 * 3600) {
+        if (
+          typeof refreshExpiresIn === "number" &&
+          refreshExpiresIn < 14 * 24 * 3600
+        ) {
           const days = Math.round(refreshExpiresIn / 86400);
-          console.error(`[qbo-client] WARNING: refresh token expires in ~${days} day(s). Re-run \`npm run auth\` before it expires.`);
+          console.error(
+            `[qbo-client] WARNING: refresh token expires in ~${days} day(s). Re-run \`npm run auth\` before it expires.`,
+          );
         }
 
         return {
@@ -338,12 +475,42 @@ export class QuickbooksClient {
 
     this.authInFlight = (async () => {
       try {
+        // Static-token mode: build the QuickBooks instance directly from the
+        // caller-supplied access token. No OAuth flow, no refresh — an expired
+        // token surfaces as a QuickBooks auth error for the caller to handle.
+        if (this.staticAccessToken) {
+          if (!this.realmId) {
+            throw new Error("QuickBooks realm ID is required");
+          }
+
+          this.quickbooksInstance = new QuickBooks(
+            this.clientId,
+            this.clientSecret,
+            this.accessToken!,
+            false, // no token secret for OAuth 2.0
+            this.realmId,
+            this.environment === "sandbox",
+            false, // debug?
+            null, // minor version
+            "2.0", // oauth version
+            this.refreshToken,
+          );
+
+          return this.quickbooksInstance;
+        }
+
         if (!this.refreshToken || !this.realmId) {
+          if (!this.allowInteractiveAuth) {
+            throw new Error(
+              "QuickBooks refresh token and realm ID are required",
+            );
+          }
+
           await this.startOAuthFlow();
 
           // Verify we have both tokens after OAuth flow
           if (!this.refreshToken || !this.realmId) {
-            throw new Error('Failed to obtain required tokens from OAuth flow');
+            throw new Error("Failed to obtain required tokens from OAuth flow");
           }
         }
 
@@ -352,11 +519,18 @@ export class QuickbooksClient {
           try {
             await this.refreshAccessToken();
           } catch (error) {
+            if (!this.allowInteractiveAuth) {
+              throw error;
+            }
+
             // A dead refresh token (rotated by another consumer, past the
             // 100-day window, or revoked) is recoverable: fall back to the
             // interactive OAuth flow instead of failing hard.
-            const message = error instanceof Error ? error.message : String(error);
-            console.error(`[qbo-client] Token refresh failed (${message}); falling back to interactive OAuth`);
+            const message =
+              error instanceof Error ? error.message : String(error);
+            console.error(
+              `[qbo-client] Token refresh failed (${message}); falling back to interactive OAuth`,
+            );
             this.refreshToken = undefined;
             this.accessToken = undefined;
             this.accessTokenExpiry = undefined;
@@ -373,11 +547,11 @@ export class QuickbooksClient {
           this.accessToken!,
           false, // no token secret for OAuth 2.0
           this.realmId!,
-          this.environment === 'sandbox',
+          this.environment === "sandbox",
           false, // debug?
-          null,  // minor version
-          '2.0', // oauth version
-          this.refreshToken
+          null, // minor version
+          "2.0", // oauth version
+          this.refreshToken,
         );
 
         return this.quickbooksInstance;
@@ -393,36 +567,50 @@ export class QuickbooksClient {
   // Checks token freshness on each invocation so handlers stay functional
   // across 60-minute token boundaries without server restarts.
   static async getInstance(): Promise<QuickBooks> {
-    if (quickbooksClient.isTokenExpiredOrExpiringSoon()) {
-      await quickbooksClient.authenticate();
+    const client = QuickbooksClient.getActiveClient();
+
+    if (client.isTokenExpiredOrExpiringSoon()) {
+      await client.authenticate();
     }
-    if (!quickbooksClient.quickbooksInstance) {
-      await quickbooksClient.authenticate();
+    if (!client.quickbooksInstance) {
+      await client.authenticate();
     }
-    return quickbooksClient.quickbooksInstance!;
+    return client.quickbooksInstance!;
   }
 
   // Static counterpart to getInstance() — returns raw OAuth credentials for
   // handlers that need to call QBO endpoints not wrapped by node-quickbooks
   // (e.g. POST /upload for binary attachments). Ensures token freshness on
   // every invocation, same as getInstance().
-  static async getAuthCredentials(): Promise<{ accessToken: string; realmId: string; isSandbox: boolean }> {
-    if (quickbooksClient.isTokenExpiredOrExpiringSoon() || !quickbooksClient.accessToken) {
-      await quickbooksClient.authenticate();
+  static async getAuthCredentials(): Promise<{
+    accessToken: string;
+    realmId: string;
+    isSandbox: boolean;
+  }> {
+    const client = QuickbooksClient.getActiveClient();
+
+    if (client.isTokenExpiredOrExpiringSoon() || !client.accessToken) {
+      await client.authenticate();
     }
-    if (!quickbooksClient.accessToken || !quickbooksClient.realmId) {
-      throw new Error('Quickbooks not authenticated');
+    if (!client.accessToken || !client.realmId) {
+      throw new Error("Quickbooks not authenticated");
     }
     return {
-      accessToken: quickbooksClient.accessToken,
-      realmId: quickbooksClient.realmId,
-      isSandbox: quickbooksClient.environment === 'sandbox',
+      accessToken: client.accessToken,
+      realmId: client.realmId,
+      isSandbox: client.environment === "sandbox",
     };
+  }
+
+  private static getActiveClient(): QuickbooksClient {
+    return quickbooksClientStorage.getStore() ?? quickbooksClient;
   }
 
   getQuickbooks() {
     if (!this.quickbooksInstance) {
-      throw new Error('Quickbooks not authenticated. Call authenticate() first');
+      throw new Error(
+        "Quickbooks not authenticated. Call authenticate() first",
+      );
     }
     return this.quickbooksInstance;
   }
